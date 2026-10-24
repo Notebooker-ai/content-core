@@ -219,11 +219,50 @@ class TestConfigCommands:
         assert result.exit_code == 0
         assert "llm_provider = anthropic" in result.output
 
+    def test_config_secret_values_are_masked(self):
+        runner = CliRunner()
+        token = "crawl4ai-super-secret-token"
+        result = runner.invoke(cli, ["config", "set", "crawl4ai_api_token", token])
+        assert result.exit_code == 0
+        assert token not in result.output
+        assert "crawl4ai_api_token = ****oken" in result.output
+
+        result = runner.invoke(cli, ["config", "list"])
+        assert result.exit_code == 0
+        assert token not in result.output
+        assert "crawl4ai_api_token = ****oken" in result.output
+
+        # Short secrets are fully masked; non-secret keys are untouched
+        result = runner.invoke(cli, ["config", "set", "crawl4ai_api_token", "abc"])
+        assert "crawl4ai_api_token = ****" in result.output
+        assert "abc" not in result.output
+        result = runner.invoke(cli, ["config", "set", "llm_provider", "anthropic"])
+        assert "llm_provider = anthropic" in result.output
+
+    def test_config_list_masks_uppercase_secret_keys(self, tmp_path):
+        # Keys written by hand into the TOML may be uppercase; still masked.
+        (tmp_path / "config.toml").write_text(
+            'CRAWL4AI_API_TOKEN = "hand-written-secret-token"\n'
+        )
+        runner = CliRunner()
+        result = runner.invoke(cli, ["config", "list"])
+        assert result.exit_code == 0
+        assert "hand-written-secret-token" not in result.output
+        assert "CRAWL4AI_API_TOKEN = ****oken" in result.output
+
     def test_config_set_invalid_key(self):
         runner = CliRunner()
         result = runner.invoke(cli, ["config", "set", "fake_key", "value"])
         assert result.exit_code == 1
         assert "Unknown config key" in result.output
+
+    def test_config_set_invalid_engine_value(self, tmp_path):
+        runner = CliRunner()
+        result = runner.invoke(cli, ["config", "set", "url_engine", "jinaa"])
+        assert result.exit_code == 1
+        assert "Invalid value for url_engine" in result.output
+        assert "jina" in result.output
+        assert not (tmp_path / "config.toml").exists()
 
     def test_config_delete(self):
         runner = CliRunner()

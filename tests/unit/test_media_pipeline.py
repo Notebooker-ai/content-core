@@ -7,6 +7,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from content_core.common.exceptions import (
+    ConfigurationError,
+    ExternalServiceError,
+    FileOperationError,
+)
 from content_core.config import ContentCoreConfig
 from content_core.common.state import ExtractionOutput
 from content_core.processors.media.video import (
@@ -154,6 +159,80 @@ class TestTranscribeAudio:
             assert result.content == "segment segment segment"
             assert result.metadata["segments_count"] == 3
             assert mock_extract.call_count == 3
+
+    async def test_configured_segment_length_changes_segment_count(self):
+        """A shorter configured segment splits the same audio into more parts."""
+        config = ContentCoreConfig(
+            stt_provider="openai",
+            stt_model="whisper-1",
+            audio_provider="openai",
+            audio_model=None,
+            audio_segment_minutes=5,
+        )
+
+        mock_stt_model = MagicMock()
+        mock_result = MagicMock()
+        mock_result.text = "segment"
+        mock_stt_model.atranscribe = AsyncMock(return_value=mock_result)
+
+        with (
+            patch("esperanto.AIFactory") as mock_factory,
+            patch(
+                "content_core.processors.media.audio.get_audio_duration",
+                new_callable=AsyncMock,
+                return_value=1500.0,  # 25 minutes -> 5 segments, not the default 3
+            ),
+            patch(
+                "content_core.processors.media.audio.extract_audio"
+            ) as mock_extract,
+        ):
+            mock_factory.create_speech_to_text.return_value = mock_stt_model
+
+            from content_core.processors.media.audio import transcribe_audio
+
+            result = await transcribe_audio("/fake/long_audio.mp3", config)
+            assert result.metadata["segments_count"] == 5
+            assert mock_extract.call_count == 5
+
+    async def test_zero_segment_minutes_sends_the_file_whole(self):
+        """Splitting off, a long file is uploaded in one piece.
+
+        Providers without an upload size limit lose whatever context a cut
+        falls across, so the split has to be avoidable.
+        """
+        config = ContentCoreConfig(
+            stt_provider="openai",
+            stt_model="whisper-1",
+            audio_provider="openai",
+            audio_model=None,
+            audio_segment_minutes=0,
+        )
+
+        mock_stt_model = MagicMock()
+        mock_result = MagicMock()
+        mock_result.text = "whole file"
+        mock_stt_model.atranscribe = AsyncMock(return_value=mock_result)
+
+        with (
+            patch("esperanto.AIFactory") as mock_factory,
+            patch(
+                "content_core.processors.media.audio.get_audio_duration",
+                new_callable=AsyncMock,
+                return_value=7200.0,  # 2 hours
+            ),
+            patch(
+                "content_core.processors.media.audio.extract_audio"
+            ) as mock_extract,
+        ):
+            mock_factory.create_speech_to_text.return_value = mock_stt_model
+
+            from content_core.processors.media.audio import transcribe_audio
+
+            result = await transcribe_audio("/fake/long_audio.mp3", config)
+            assert result.content == "whole file"
+            assert result.metadata["segments_count"] == 1
+            mock_extract.assert_not_called()
+            assert mock_stt_model.atranscribe.call_args.args[0] == "/fake/long_audio.mp3"
 
     async def test_split_segments_keep_source_extension(self):
         """Segments are stream-copied, so the container must match the source.
@@ -320,8 +399,87 @@ class TestExtractAudio:
 
             from content_core.processors.media.audio import extract_audio
 
-            with pytest.raises(RuntimeError, match="ffmpeg extract failed"):
+            with pytest.raises(FileOperationError, match="ffmpeg extract failed"):
                 extract_audio("/in.mp3", "/out.mp3")
+
+    def test_missing_ffmpeg_binary_raises_file_operation_error(self):
+        with patch(
+            "content_core.processors.media.audio.subprocess.run",
+            side_effect=FileNotFoundError("ffmpeg"),
+        ):
+            from content_core.processors.media.audio import extract_audio
+
+            with pytest.raises(FileOperationError, match="is ffmpeg installed"):
+                extract_audio("/in.mp3", "/out.mp3")
+
+
+class TestTranscribeAudioFailures:
+    @pytest.fixture
+    def config(self):
+        return ContentCoreConfig(stt_provider="openai", stt_model="whisper-1")
+
+    async def test_ffprobe_failure_raises_file_operation_error(self, config):
+        with patch(
+            "content_core.processors.media.audio.subprocess.run",
+            return_value=MagicMock(returncode=1, stderr="Invalid data found"),
+        ):
+            from content_core.processors.media.audio import transcribe_audio
+
+            with pytest.raises(FileOperationError, match="ffprobe failed"):
+                await transcribe_audio("/fake/corrupted.mp3", config)
+
+    async def test_stt_provider_failure_raises_external_service_error(self, config):
+        with (
+            patch("esperanto.AIFactory"),
+            patch(
+                "content_core.processors.media.audio.get_audio_duration",
+                new_callable=AsyncMock,
+                return_value=60.0,
+            ),
+            patch(
+                "content_core.processors.media.audio._transcribe_segment",
+                new_callable=AsyncMock,
+                side_effect=ValueError("401 invalid api key"),
+            ),
+        ):
+            from content_core.processors.media.audio import transcribe_audio
+
+            with pytest.raises(ExternalServiceError) as exc_info:
+                await transcribe_audio("/fake/audio.mp3", config)
+            assert isinstance(exc_info.value.__cause__, ValueError)
+
+    async def test_stt_model_creation_failure_raises_configuration_error(self, config):
+        with (
+            patch("esperanto.AIFactory") as mock_factory,
+            patch(
+                "content_core.processors.media.audio.get_audio_duration",
+                new_callable=AsyncMock,
+                return_value=60.0,
+            ),
+        ):
+            mock_factory.create_speech_to_text.side_effect = ValueError("no API key")
+            from content_core.processors.media.audio import transcribe_audio
+
+            with pytest.raises(ConfigurationError, match="openai/whisper-1"):
+                await transcribe_audio("/fake/audio.mp3", config)
+
+    async def test_explicit_audio_model_failure_does_not_fall_back(self, config):
+        """An explicit audio model that cannot be created raises; no default fallback."""
+        config = ContentCoreConfig(audio_provider="groq", audio_model="whisper-large-v3")
+        with (
+            patch("esperanto.AIFactory") as mock_factory,
+            patch(
+                "content_core.processors.media.audio.get_audio_duration",
+                new_callable=AsyncMock,
+                return_value=60.0,
+            ),
+        ):
+            mock_factory.create_speech_to_text.side_effect = ValueError("no API key")
+            from content_core.processors.media.audio import transcribe_audio
+
+            with pytest.raises(ConfigurationError, match="groq/whisper-large-v3"):
+                await transcribe_audio("/fake/audio.mp3", config)
+            mock_factory.create_speech_to_text.assert_called_once()
 
 
 class TestExtractVideo:
@@ -384,6 +542,97 @@ class TestExtractVideo:
         with patch("os.path.exists", return_value=False):
             with pytest.raises(FileNotFoundError):
                 await extract_video("/no/such/video.mp4", config)
+
+    async def test_ffprobe_failure_raises_file_operation_error(self, config):
+        """ffprobe failing is an error, not 'no audio streams'."""
+        with (
+            patch("os.path.exists", return_value=True),
+            patch(
+                "content_core.processors.media.audio.subprocess.run",
+                return_value=MagicMock(returncode=1, stderr="moov atom not found"),
+            ),
+        ):
+            with pytest.raises(FileOperationError, match="ffprobe failed"):
+                await extract_video("/fake/corrupted.mp4", config)
+
+    async def test_ffmpeg_failure_raises_file_operation_error(self, config):
+        streams = [{"bit_rate": "128000", "channels": 2, "sample_rate": "44100"}]
+        with (
+            patch("os.path.exists", return_value=True),
+            patch(
+                "content_core.processors.media.video.get_audio_streams",
+                new_callable=AsyncMock,
+                return_value=streams,
+            ),
+            patch(
+                "content_core.processors.media.audio.subprocess.run",
+                return_value=MagicMock(returncode=1, stderr="encoder not found"),
+            ),
+        ):
+            with pytest.raises(FileOperationError, match="ffmpeg failed"):
+                await extract_video("/fake/video.mp4", config)
+
+    async def test_intermediate_audio_lives_outside_source_dir(self, config):
+        """Regression for #74: the intermediate .mp3 must not be written next
+        to the source video, and a user's <name>_audio.mp3 must survive."""
+        streams = [{"bit_rate": "128000", "channels": 2, "sample_rate": "44100"}]
+
+        with tempfile.TemporaryDirectory() as source_dir:
+            video_path = os.path.join(source_dir, "interview.mp4")
+            user_audio = os.path.join(source_dir, "interview_audio.mp3")
+            with open(video_path, "wb") as f:
+                f.write(b"fake video")
+            with open(user_audio, "wb") as f:
+                f.write(b"user's own audio")
+
+            seen = {}
+
+            async def fake_extract(input_file, output_file, stream_index):
+                seen["output_file"] = output_file
+                with open(output_file, "wb") as f:
+                    f.write(b"extracted")
+                return True
+
+            async def fake_transcribe(audio_path, cfg):
+                seen["transcribed"] = audio_path
+                assert os.path.exists(audio_path)
+                return ExtractionOutput(
+                    content="ok", source_type="file", identified_type="audio/*"
+                )
+
+            with (
+                patch(
+                    "content_core.processors.media.video.get_audio_streams",
+                    new_callable=AsyncMock,
+                    return_value=streams,
+                ),
+                patch(
+                    "content_core.processors.media.video.select_best_audio_stream",
+                    new_callable=AsyncMock,
+                    return_value=streams[0],
+                ),
+                patch(
+                    "content_core.processors.media.video.extract_audio_from_video",
+                    side_effect=fake_extract,
+                ),
+                patch(
+                    "content_core.processors.media.audio.transcribe_audio",
+                    side_effect=fake_transcribe,
+                ),
+            ):
+                result = await extract_video(video_path, config)
+
+            assert result.content == "ok"
+            assert seen["transcribed"] == seen["output_file"]
+            # Intermediate is not derived from the source directory
+            assert os.path.dirname(seen["output_file"]) != source_dir
+            assert not seen["output_file"].startswith(source_dir + os.sep)
+            # Intermediate is cleaned up after extraction
+            assert not os.path.exists(seen["output_file"])
+            # Source directory is untouched: same files, user's audio intact
+            assert sorted(os.listdir(source_dir)) == ["interview.mp4", "interview_audio.mp3"]
+            with open(user_audio, "rb") as f:
+                assert f.read() == b"user's own audio"
 
 
 class TestSelectBestAudioStream:

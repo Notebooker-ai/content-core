@@ -3,15 +3,23 @@ from typing import Optional
 
 import aiohttp
 
+from content_core.common.exceptions import ConfigurationError
 from content_core.common.retry import retry_url_api
 from content_core.config import ContentCoreConfig, get_default_config
 from content_core.logging import logger
 
 
 @retry_url_api()
-async def _fetch_url_crawl4ai_docker(url: str, api_url: str) -> dict:
-    """Fetch URL content via Crawl4AI Docker API."""
-    async with aiohttp.ClientSession(trust_env=True) as session:
+async def _fetch_url_crawl4ai_docker(
+    url: str, api_url: str, api_token: Optional[str] = None
+) -> dict:
+    """Fetch URL content via Crawl4AI Docker API.
+
+    Crawl4AI >= 0.9.0 requires a bearer token for external connections by
+    default; when ``api_token`` is set it is sent as ``Authorization: Bearer``.
+    """
+    headers = {"Authorization": f"Bearer {api_token}"} if api_token else None
+    async with aiohttp.ClientSession(trust_env=True, headers=headers) as session:
         async with session.post(
             f"{api_url.rstrip('/')}/crawl",
             json={"urls": [url], "priority": 10},
@@ -24,6 +32,10 @@ async def _fetch_url_crawl4ai_docker(url: str, api_url: str) -> dict:
         raise ValueError("No results returned from Crawl4AI Docker API")
 
     result = data["results"][0]
+    if result.get("success") is False:
+        raise RuntimeError(
+            f"Crawl4AI could not crawl {url}: {result.get('error_message') or 'unknown error'}"
+        )
     title = result.get("metadata", {}).get("title", "")
 
     # Docker API: markdown can be a dict with raw_markdown or a string
@@ -44,10 +56,12 @@ async def _fetch_url_crawl4ai_local(url: str) -> dict:
     """Fetch URL content via local Crawl4AI browser automation."""
     try:
         from crawl4ai import AsyncWebCrawler, CrawlerRunConfig, ProxyConfig
-    except ImportError:
-        raise ImportError(
-            "Crawl4AI is not installed. Install it with: pip install content-core[crawl4ai]"
-        )
+    except ImportError as e:
+        raise ConfigurationError(
+            "Crawl4AI is not installed. Install it with: "
+            "pip install content-core[crawl4ai], or use another url_engine "
+            "(e.g. CCORE_URL_ENGINE=auto)."
+        ) from e
 
     # Bridge HTTP_PROXY to Crawl4AI's ProxyConfig
     proxy_url = os.environ.get("HTTP_PROXY") or os.environ.get("HTTPS_PROXY")
@@ -68,11 +82,23 @@ async def _fetch_url_crawl4ai_local(url: str) -> dict:
         else:
             result = await crawler.arun(url=url)
 
+        # A failed crawl (navigation timeout, blocked page...) is returned, not
+        # raised, with markdown=None; surface it so the router can type it.
+        if not result.success:
+            raise RuntimeError(
+                f"Crawl4AI could not crawl {url}: {result.error_message or 'unknown error'}"
+            )
+
         title = ""
         if hasattr(result, "metadata") and result.metadata:
             title = result.metadata.get("title", "")
 
-        content = result.markdown if hasattr(result, "markdown") else ""
+        # Recent crawl4ai returns a str subclass; older releases return a
+        # MarkdownGenerationResult, whose page text is raw_markdown.
+        markdown = result.markdown
+        if markdown is not None and not isinstance(markdown, str):
+            markdown = getattr(markdown, "raw_markdown", None)
+        content = str(markdown or "")
 
         return {
             "title": title or "No title found",
@@ -80,24 +106,25 @@ async def _fetch_url_crawl4ai_local(url: str) -> dict:
         }
 
 
-async def extract_url_crawl4ai(url: str, config: Optional[ContentCoreConfig] = None) -> dict | None:
+async def extract_url_crawl4ai(url: str, config: Optional[ContentCoreConfig] = None) -> dict:
     """Get the content of a URL using Crawl4AI.
 
     Automatically selects Docker API mode (when CRAWL4AI_API_URL is set)
     or local browser automation mode.
 
-    Returns {"title": ..., "content": ...} or None on failure.
+    Returns {"title": ..., "content": ...}; raises on failure.
     """
     cfg = config or get_default_config()
     api_url = os.environ.get("CRAWL4AI_API_URL") or cfg.crawl4ai_api_url
+    api_token = os.environ.get("CRAWL4AI_API_TOKEN") or cfg.crawl4ai_api_token
 
     try:
         if api_url:
             logger.debug(f"Using Crawl4AI Docker API at: {api_url}")
-            return await _fetch_url_crawl4ai_docker(url, api_url)
+            return await _fetch_url_crawl4ai_docker(url, api_url, api_token)
         else:
             logger.debug("Using Crawl4AI local browser automation")
             return await _fetch_url_crawl4ai_local(url)
     except Exception as e:
         logger.error(f"Crawl4AI extraction failed for {url}: {e}")
-        return None
+        raise

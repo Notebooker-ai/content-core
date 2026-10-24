@@ -7,7 +7,14 @@ from urllib.parse import urlparse
 
 import aiohttp
 
-from content_core.common.exceptions import InvalidInputError, UnsupportedTypeException
+from content_core.common.exceptions import (
+    ConfigurationError,
+    ContentCoreError,
+    FileOperationError,
+    InvalidInputError,
+    UnsupportedTypeException,
+)
+from content_core.common.messages import DOCLING_MISSING_MESSAGE
 from content_core.common.retry import retry_download
 from content_core.config import ContentCoreConfig, get_default_config
 from content_core.logging import logger
@@ -21,7 +28,11 @@ from content_core.processors.document.pdf_vision import extract_pdf_with_vision
 from content_core.processors.document.epub import SUPPORTED_EPUB_TYPES, extract_epub_file
 from content_core.processors.document.image import extract_image
 from content_core.processors.text import extract_text_file, process_text
-from content_core.processors.url import detect_remote_mime, extract_from_url
+from content_core.processors.url import (
+    detect_remote_mime,
+    extract_from_url,
+    to_typed_url_error,
+)
 from content_core.processors.media.video import extract_video
 from content_core.processors.media.video_vision import extract_video_with_vision
 from content_core.processors.url.reddit import extract_reddit, is_reddit_post
@@ -62,6 +73,26 @@ async def extract_content(
 
     Returns:
         ExtractionOutput with extracted content
+
+    Raises:
+        InvalidInputError: no source provided, or the input is malformed.
+        UnsupportedTypeException: the file/MIME type is not one we route.
+        ConfigurationError: a configuration cannot be honored (e.g.
+            ``document_engine="docling"`` with the extra not installed).
+        NoTranscriptFound: a YouTube video has no usable transcript.
+        NotFoundError: a URL answered 404/410.
+        NetworkError: a URL (or an engine API) could not be reached --
+            connection, timeout, or DNS failure.
+        ExternalServiceError: an external service failed (URL engine API,
+            STT provider, YouTube blocking every transcript path), including
+            auth and rate-limit responses.
+        FileOperationError: a routed file exists but could not be parsed or
+            processed (corrupted PDF/EPUB, ffmpeg/ffprobe failure).
+        FileNotFoundError: ``file_path`` does not exist.
+
+        Every typed failure derives from ``ContentCoreError``, so a caller
+        that wants a single handler can catch that. A source that was
+        genuinely empty returns ``content=""`` instead of raising.
     """
     cfg = config or get_default_config()
 
@@ -77,9 +108,13 @@ async def extract_content(
 
 async def _extract_url(url: str, cfg: ContentCoreConfig) -> ExtractionOutput:
     """Route URL to appropriate processor."""
+    try:
+        parsed = urlparse(url)
+        hostname = (parsed.hostname or "").lower()
+    except ValueError as e:  # e.g. a malformed IPv6 netloc
+        raise InvalidInputError(f"Invalid URL {url}: {e}") from e
+
     # YouTube detection
-    parsed = urlparse(url)
-    hostname = (parsed.hostname or "").lower()
     if hostname in ("youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"):
         return await extract_youtube(url, cfg)
 
@@ -122,23 +157,34 @@ def _route_for_mime(mime: str, cfg: ContentCoreConfig) -> str | None:
 
     Returns the processor name ("docling", "pdf", "epub", "office", "video",
     "audio", "image", "text") or ``None`` if the type is unsupported.
+
+    Raises:
+        ConfigurationError: if ``document_engine="docling"`` was named
+            explicitly but docling is not installed. An explicit engine is a
+            requirement, not a preference: it is honored or it raises, never
+            silently substituted (see ARCHITECTURE.md).
     """
     engine = cfg.document_engine
-    # When vision is configured + engine="auto" + mime is vision-routable
-    # (PDF/image/video), prefer the vision processor over auto-docling.
-    # Explicit engine="docling" still runs docling.
+    docling_usable = DOCLING_AVAILABLE and extract_docling is not None
+
+    if engine == "docling":
+        if not docling_usable:
+            raise ConfigurationError(DOCLING_MISSING_MESSAGE)
+        return "docling"
+
     vision_routable = (
         mime in SUPPORTED_PDF_TYPES
         or mime.startswith("image/")
         or mime.startswith("video/")
     )
-    skip_auto_docling = engine == "auto" and _has_vision(cfg) and vision_routable
-    if not skip_auto_docling and (
-        engine == "docling"
-        or (engine == "auto" and DOCLING_AVAILABLE and mime in DOCLING_SUPPORTED)
+    skip_auto_docling = _has_vision(cfg) and vision_routable
+    if (
+        engine == "auto"
+        and not skip_auto_docling
+        and docling_usable
+        and mime in DOCLING_SUPPORTED
     ):
-        if DOCLING_AVAILABLE and extract_docling is not None:
-            return "docling"
+        return "docling"
 
     if mime in SUPPORTED_PDF_TYPES:
         return "pdf"
@@ -152,7 +198,7 @@ def _route_for_mime(mime: str, cfg: ContentCoreConfig) -> str | None:
         return "audio"
     if mime.startswith("image/"):
         return "image"
-    if mime == "text/plain":
+    if mime in ("text/plain", "text/html"):
         return "text"
     return None
 
@@ -197,7 +243,21 @@ async def check_file_support(
             reason=str(exc),
         )
 
-    processor = _route_for_mime(mime, cfg)
+    # An explicitly named engine that cannot be honored (e.g. docling requested
+    # but not installed) raises from routing. Here it is a verdict, not an
+    # error: pre-flight answers "no, and here is why" instead of raising.
+    try:
+        processor = _route_for_mime(mime, cfg)
+    except ConfigurationError as exc:
+        return FileSupport(
+            supported=False,
+            file_path=file_path,
+            identified_type=mime,
+            document_engine=cfg.document_engine,
+            processor=None,
+            reason=str(exc),
+        )
+
     supported = processor is not None
     return FileSupport(
         supported=supported,
@@ -287,12 +347,22 @@ async def _fetch_remote_file(url: str) -> tuple:
 async def _download_remote_file(url: str) -> str:
     """Download a remote file to a temp path."""
     logger.debug(f"Downloading remote file: {url}")
-    mime, content = await _fetch_remote_file(url)
+    try:
+        mime, content = await _fetch_remote_file(url)
+    except ContentCoreError:
+        raise
+    except Exception as e:
+        raise to_typed_url_error(e, url, "download") from e
     suffix = os.path.splitext(urlparse(url).path)[1] if urlparse(url).path else ""
-    fd, tmp = tempfile.mkstemp(suffix=suffix)
-    os.close(fd)
-    with open(tmp, "wb") as f:
-        f.write(content)
+    tmp = None
+    try:
+        fd, tmp = tempfile.mkstemp(suffix=suffix)
+        with os.fdopen(fd, "wb") as f:
+            f.write(content)
+    except OSError as e:
+        if tmp is not None:
+            _safe_delete(tmp)
+        raise FileOperationError(f"Could not save download of {url}: {e}") from e
     return tmp
 
 

@@ -1,8 +1,20 @@
 """Content Core — Extract and summarize content from any source."""
 from dotenv import load_dotenv
+from loguru import logger
 
 load_dotenv()
 
+from content_core.common.exceptions import (
+    ConfigurationError,
+    ContentCoreError,
+    ExternalServiceError,
+    FileOperationError,
+    InvalidInputError,
+    NetworkError,
+    NoTranscriptFound,
+    NotFoundError,
+    UnsupportedTypeException,
+)
 from content_core.config import ContentCoreConfig
 from content_core.content.summary import summarize
 from content_core.extraction import check_file_support, extract_content
@@ -12,10 +24,13 @@ from content_core.common.state import ExtractionInput, ExtractionOutput, FileSup
 # Convenience alias
 extract = extract_content
 
-# Configure default logging
-configure_logging(debug=False)
+# Libraries must not configure logging — loguru's logger is a process-wide
+# singleton. Stay silent by default; applications opt in via
+# `logger.enable("content_core")` or `content_core.configure_logging()`.
+logger.disable("content_core")
 
 __all__ = [
+    "configure_logging",
     "extract_content",
     "extract",
     "check_file_support",
@@ -24,4 +39,14 @@ __all__ = [
     "ExtractionInput",
     "ExtractionOutput",
     "FileSupport",
+    # Exceptions -- every failure escaping extract_content is one of these
+    "ContentCoreError",
+    "UnsupportedTypeException",
+    "InvalidInputError",
+    "ConfigurationError",
+    "NotFoundError",
+    "NoTranscriptFound",
+    "NetworkError",
+    "ExternalServiceError",
+    "FileOperationError",
 ]

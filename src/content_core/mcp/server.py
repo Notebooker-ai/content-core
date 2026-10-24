@@ -1,14 +1,25 @@
 """Content Core MCP Server — extract and summarize content."""
-import sys
+from importlib.metadata import PackageNotFoundError, version
+from typing import get_args
 
 from fastmcp import FastMCP
 from loguru import logger
 
-# Configure loguru for MCP (stderr only, no stdout interference)
-logger.remove()
-logger.add(sys.stderr, level="INFO")
+from content_core.common.types import DocumentEngine, UrlEngine
+from content_core.logging import configure_logging
 
-mcp = FastMCP("Content Core")
+VALID_URL_ENGINES = frozenset(get_args(UrlEngine))
+VALID_DOC_ENGINES = frozenset(get_args(DocumentEngine))
+
+
+def _package_version() -> str:
+    try:
+        return version("content-core")
+    except PackageNotFoundError:
+        return "0.0.0"
+
+
+mcp = FastMCP("Content Core", version=_package_version())
 
 
 @mcp.tool
@@ -25,7 +36,13 @@ async def extract_content(
     Args:
         url: URL to extract content from (web page, YouTube video, PDF link, etc.)
         file_path: Local file path to extract content from
-        engine: Optional extraction engine override (firecrawl, jina, crawl4ai, simple, docling)
+        engine: Optional extraction engine override, routed by input type.
+            With `url`: auto, simple, firecrawl, jina, crawl4ai.
+            With `file_path`: auto, simple, docling — `docling` requires
+            `pip install "content-core[docling]"` and fails with a
+            configuration error when the extra is missing, in which case use
+            `auto` or `simple`.
+            Any other value is rejected with an error naming the accepted ones.
         formulas: Enable formula extraction via Docling (requires engine=docling)
         pictures: Enable image description + chart data extraction via Docling (requires engine=docling)
         no_ocr: Disable OCR in Docling (requires engine=docling)
@@ -44,10 +61,19 @@ async def extract_content(
     kwargs = {}
     if engine:
         if file_path:
+            if engine not in VALID_DOC_ENGINES:
+                return (
+                    f"Error: Invalid document engine '{engine}'. "
+                    f"Choose from: {', '.join(sorted(VALID_DOC_ENGINES))}"
+                )
             kwargs["document_engine"] = engine
         else:
+            if engine not in VALID_URL_ENGINES:
+                return (
+                    f"Error: Invalid URL engine '{engine}'. "
+                    f"Choose from: {', '.join(sorted(VALID_URL_ENGINES))}"
+                )
             kwargs["url_engine"] = engine
-            kwargs["document_engine"] = engine
     if formulas:
         kwargs["docling_formulas"] = True
     if pictures:
@@ -97,8 +123,17 @@ async def summarize_content(
         return f"Error: {e}"
 
 
-def main():
-    """Entry point for the MCP server."""
+def main(debug: bool = False):
+    """Entry point for the MCP server.
+
+    Args:
+        debug: Force DEBUG level. Forwarded by ``content-core --debug mcp``; the
+            bare ``content-core-mcp`` console script has no click context and
+            takes the default, configuring itself since nothing else will.
+    """
+    # Configure logging here, not at import time: stderr only, so nothing ever
+    # contaminates the stdout JSON-RPC stream.
+    configure_logging(debug=debug)
     logger.info("Starting Content Core MCP Server")
     mcp.run()
 

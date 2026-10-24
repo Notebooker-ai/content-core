@@ -63,6 +63,10 @@ class TestDefaults:
         cfg = ContentCoreConfig()
         assert cfg.audio_concurrency == 3
 
+    def test_audio_segment_minutes_default(self):
+        cfg = ContentCoreConfig()
+        assert cfg.audio_segment_minutes == 10
+
     def test_firecrawl_api_url_default(self):
         cfg = ContentCoreConfig()
         assert cfg.firecrawl_api_url == "https://api.firecrawl.dev"
@@ -111,6 +115,10 @@ class TestConstructorOverride:
         cfg = ContentCoreConfig(audio_concurrency=5)
         assert cfg.audio_concurrency == 5
 
+    def test_audio_segment_minutes_override(self):
+        cfg = ContentCoreConfig(audio_segment_minutes=360)
+        assert cfg.audio_segment_minutes == 360
+
     def test_llm_model_override(self):
         cfg = ContentCoreConfig(llm_model="gpt-4o")
         assert cfg.llm_model == "gpt-4o"
@@ -128,6 +136,11 @@ class TestEnvVarOverride:
         monkeypatch.setenv("CCORE_AUDIO_CONCURRENCY", "7")
         cfg = ContentCoreConfig()
         assert cfg.audio_concurrency == 7
+
+    def test_audio_segment_minutes_from_env(self, monkeypatch):
+        monkeypatch.setenv("CCORE_AUDIO_SEGMENT_MINUTES", "0")
+        cfg = ContentCoreConfig()
+        assert cfg.audio_segment_minutes == 0
 
     def test_llm_model_from_env(self, monkeypatch):
         monkeypatch.setenv("CCORE_LLM_MODEL", "claude-sonnet")
@@ -162,6 +175,14 @@ class TestValidation:
         cfg = ContentCoreConfig(audio_concurrency=10)
         assert cfg.audio_concurrency == 10
 
+    def test_audio_segment_minutes_negative(self):
+        with pytest.raises(ValidationError):
+            ContentCoreConfig(audio_segment_minutes=-1)
+
+    def test_audio_segment_minutes_zero_boundary(self):
+        cfg = ContentCoreConfig(audio_segment_minutes=0)
+        assert cfg.audio_segment_minutes == 0
+
 
 class TestPriority:
     """Verify constructor args beat env vars."""
@@ -192,6 +213,56 @@ class TestSingleton:
         assert cfg1 is not cfg2
 
     def test_singleton_picks_up_env(self, monkeypatch):
-        monkeypatch.setenv("CCORE_URL_ENGINE", "bs4")
+        monkeypatch.setenv("CCORE_URL_ENGINE", "jina")
         cfg = get_default_config()
-        assert cfg.url_engine == "bs4"
+        assert cfg.url_engine == "jina"
+
+
+class TestEngineVocabulary:
+    """Closed-vocabulary engine fields are validated at construction."""
+
+    @pytest.mark.parametrize(
+        "field, value",
+        [
+            ("url_engine", "jinaa"),
+            ("url_engine", "docling"),
+            ("document_engine", "doclingg"),
+            ("document_engine", "firecrawl"),
+        ],
+    )
+    def test_invalid_engine_raises(self, field, value):
+        with pytest.raises(ValidationError) as exc:
+            ContentCoreConfig(**{field: value})
+        assert field in str(exc.value)
+
+    def test_invalid_url_engine_message_lists_valid_values(self):
+        with pytest.raises(ValidationError) as exc:
+            ContentCoreConfig(url_engine="jinaa")
+        message = str(exc.value)
+        for valid in ("auto", "simple", "firecrawl", "jina", "crawl4ai"):
+            assert f"'{valid}'" in message
+
+    def test_invalid_document_engine_message_lists_valid_values(self):
+        with pytest.raises(ValidationError) as exc:
+            ContentCoreConfig(document_engine="doclingg")
+        message = str(exc.value)
+        for valid in ("auto", "simple", "docling"):
+            assert f"'{valid}'" in message
+
+    def test_invalid_url_engine_from_env_raises(self, monkeypatch):
+        monkeypatch.setenv("CCORE_URL_ENGINE", "jinaa")
+        with pytest.raises(ValidationError):
+            ContentCoreConfig()
+
+    def test_invalid_document_engine_from_env_raises(self, monkeypatch):
+        monkeypatch.setenv("CCORE_DOCUMENT_ENGINE", "doclingg")
+        with pytest.raises(ValidationError):
+            ContentCoreConfig()
+
+    @pytest.mark.parametrize("value", ["auto", "simple", "firecrawl", "jina", "crawl4ai"])
+    def test_valid_url_engines_accepted(self, value):
+        assert ContentCoreConfig(url_engine=value).url_engine == value
+
+    @pytest.mark.parametrize("value", ["auto", "simple", "docling"])
+    def test_valid_document_engines_accepted(self, value):
+        assert ContentCoreConfig(document_engine=value).document_engine == value

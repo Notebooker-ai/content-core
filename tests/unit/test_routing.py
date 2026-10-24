@@ -1,13 +1,23 @@
 """Tests for the v2 extraction orchestrator routing logic."""
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+import os
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import aiohttp
 import pytest
 
-from content_core.common.exceptions import InvalidInputError, UnsupportedTypeException
+from content_core.common.exceptions import (
+    ConfigurationError,
+    FileOperationError,
+    InvalidInputError,
+    NetworkError,
+    NotFoundError,
+    UnsupportedTypeException,
+)
+from content_core.common.messages import DOCLING_MISSING_MESSAGE
 from content_core.config import ContentCoreConfig
-from content_core.extraction import check_file_support, extract_content
+from content_core.extraction import _route_for_mime, check_file_support, extract_content
 from content_core.common.state import ExtractionOutput, FileSupport
 
 
@@ -141,6 +151,66 @@ async def test_url_pdf_downloads_and_calls_extract_pdf():
         mock_extract_file.assert_awaited_once()
         # source_type should be overridden to "url"
         assert result.source_type == "url"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error, expected",
+    [
+        (
+            aiohttp.ClientResponseError(
+                request_info=MagicMock(), history=(), status=404, message="Not Found"
+            ),
+            NotFoundError,
+        ),
+        (aiohttp.ClientConnectionError("Cannot connect to host"), NetworkError),
+    ],
+)
+async def test_url_download_failure_raises_typed(error, expected):
+    """A failed remote-file download raises typed, never untyped aiohttp."""
+    with patch(
+        "content_core.extraction.detect_remote_mime",
+        new_callable=AsyncMock,
+        return_value="application/pdf",
+    ), patch(
+        "content_core.extraction._fetch_remote_file",
+        new_callable=AsyncMock,
+        side_effect=error,
+    ):
+        with pytest.raises(expected) as exc_info:
+            await extract_content(url="https://example.com/doc.pdf")
+    assert exc_info.value.__cause__ is error
+
+
+@pytest.mark.asyncio
+async def test_url_download_save_failure_raises_file_operation_error(tmp_path):
+    """A temp file that cannot be written is typed and cleaned up."""
+    created = []
+    real_mkstemp = __import__("tempfile").mkstemp
+
+    def mkstemp(*args, **kwargs):
+        fd, path = real_mkstemp(dir=tmp_path, *args, **kwargs)
+        created.append(path)
+        return fd, path
+
+    def failing_fdopen(fd, *args, **kwargs):
+        os.close(fd)
+        raise OSError("disk full")
+
+    with patch(
+        "content_core.extraction.detect_remote_mime",
+        new_callable=AsyncMock,
+        return_value="application/pdf",
+    ), patch(
+        "content_core.extraction._fetch_remote_file",
+        new_callable=AsyncMock,
+        return_value=("application/pdf", b"%PDF"),
+    ), patch("content_core.extraction.tempfile.mkstemp", side_effect=mkstemp), patch(
+        "content_core.extraction.os.fdopen", side_effect=failing_fdopen
+    ):
+        with pytest.raises(FileOperationError, match="disk full"):
+            await extract_content(url="https://example.com/doc.pdf")
+    assert created and not any(os.path.exists(p) for p in created)
 
 
 # ---------------------------------------------------------------------------
@@ -407,3 +477,222 @@ async def test_check_file_support_agrees_with_extraction():
         # extraction of the same type raises, confirming the verdict
         with pytest.raises(UnsupportedTypeException):
             await extract_content(file_path="/tmp/test.bin", config=cfg)
+
+
+# ---------------------------------------------------------------------------
+# 15. text/html routes to the text processor on the simple/no-docling path
+# ---------------------------------------------------------------------------
+def test_route_for_mime_html_goes_to_text():
+    cfg = ContentCoreConfig(document_engine="simple")
+    assert _route_for_mime("text/html", cfg) == "text"
+
+
+@pytest.mark.asyncio
+async def test_file_html_calls_extract_text_file():
+    expected = _make_output(identified_type="text/html")
+    cfg = ContentCoreConfig(document_engine="simple")
+    with patch(
+        "content_core.content.identification.get_file_type",
+        new_callable=AsyncMock,
+        return_value="text/html",
+    ), patch(
+        "content_core.extraction.extract_text_file",
+        new_callable=AsyncMock,
+        return_value=expected,
+    ) as mock:
+        result = await extract_content(file_path="/tmp/page.html", config=cfg)
+        mock.assert_awaited_once()
+        assert result is expected
+        assert result.identified_type == "text/html"
+
+
+@pytest.mark.asyncio
+async def test_check_file_support_html_file(tmp_path):
+    page = tmp_path / "page.html"
+    page.write_text("<html><head><title>T</title></head><body><p>Hi</p></body></html>")
+    cfg = ContentCoreConfig(document_engine="simple")
+    result = await check_file_support(str(page), config=cfg)
+    assert result.supported is True
+    assert result.identified_type == "text/html"
+    assert result.processor == "text"
+
+
+# ---------------------------------------------------------------------------
+# 16. Explicit document_engine="docling" with docling not installed
+# ---------------------------------------------------------------------------
+def _docling_missing():
+    """Patch the orchestrator's view of docling to "not installed"."""
+    return patch.multiple(
+        "content_core.extraction",
+        DOCLING_AVAILABLE=False,
+        extract_docling=None,
+    )
+
+
+def _docling_installed(mock_extract):
+    """Patch the orchestrator's view of docling to "installed"."""
+    return patch.multiple(
+        "content_core.extraction",
+        DOCLING_AVAILABLE=True,
+        extract_docling=mock_extract,
+    )
+
+
+def test_route_for_mime_explicit_docling_missing_raises():
+    cfg = ContentCoreConfig(document_engine="docling")
+    with _docling_missing():
+        with pytest.raises(ConfigurationError) as exc_info:
+            _route_for_mime("application/pdf", cfg)
+    message = str(exc_info.value)
+    assert "pip install content-core[docling]" in message
+    assert "CCORE_DOCUMENT_ENGINE=simple" in message
+    # Single source of truth: routing and the docling stub share one string.
+    assert message == DOCLING_MISSING_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_extract_explicit_docling_missing_raises():
+    """An explicitly named engine is honored or it raises -- never substituted."""
+    cfg = ContentCoreConfig(document_engine="docling")
+    with _docling_missing(), patch(
+        "content_core.content.identification.get_file_type",
+        new_callable=AsyncMock,
+        return_value="application/pdf",
+    ), patch(
+        "content_core.extraction.extract_pdf_file", new_callable=AsyncMock
+    ) as mock_pdf:
+        with pytest.raises(ConfigurationError) as exc_info:
+            await extract_content(file_path="/tmp/test.pdf", config=cfg)
+        mock_pdf.assert_not_awaited()
+    assert "pip install content-core[docling]" in str(exc_info.value)
+    assert "CCORE_DOCUMENT_ENGINE=simple" in str(exc_info.value)
+
+
+def test_route_for_mime_auto_docling_missing_falls_back():
+    """`auto` is a preference: it degrades to the standard processors silently."""
+    cfg = ContentCoreConfig(document_engine="auto")
+    with _docling_missing():
+        assert _route_for_mime("application/pdf", cfg) == "pdf"
+
+
+@pytest.mark.asyncio
+async def test_extract_auto_docling_missing_uses_standard_processor():
+    cfg = ContentCoreConfig(document_engine="auto")
+    expected = _make_output(identified_type="application/pdf")
+    with _docling_missing(), patch(
+        "content_core.content.identification.get_file_type",
+        new_callable=AsyncMock,
+        return_value="application/pdf",
+    ), patch(
+        "content_core.extraction.extract_pdf_file",
+        new_callable=AsyncMock,
+        return_value=expected,
+    ) as mock_pdf:
+        result = await extract_content(file_path="/tmp/test.pdf", config=cfg)
+    mock_pdf.assert_awaited_once()
+    assert result is expected
+
+
+def test_route_for_mime_explicit_docling_installed_still_routes():
+    """Docling-available paths are unchanged."""
+    cfg = ContentCoreConfig(document_engine="docling")
+    with _docling_installed(AsyncMock()):
+        assert _route_for_mime("application/pdf", cfg) == "docling"
+
+
+def test_route_for_mime_auto_docling_installed_still_routes():
+    cfg = ContentCoreConfig(document_engine="auto")
+    with _docling_installed(AsyncMock()), patch(
+        "content_core.extraction.DOCLING_SUPPORTED", {"application/pdf"}
+    ):
+        assert _route_for_mime("application/pdf", cfg) == "docling"
+
+
+@pytest.mark.asyncio
+async def test_check_file_support_explicit_docling_missing_is_a_verdict():
+    """Pre-flight reports the unhonorable engine as a verdict, it does not raise."""
+    cfg = ContentCoreConfig(document_engine="docling")
+    with _docling_missing(), patch(
+        "content_core.content.identification.get_file_type",
+        new_callable=AsyncMock,
+        return_value="application/pdf",
+    ):
+        result = await check_file_support("/tmp/test.pdf", config=cfg)
+    assert result.supported is False
+    assert result.processor is None
+    assert result.identified_type == "application/pdf"
+    assert result.document_engine == "docling"
+    assert "pip install content-core[docling]" in result.reason
+    assert "CCORE_DOCUMENT_ENGINE=simple" in result.reason
+
+
+@pytest.mark.asyncio
+async def test_check_file_support_reason_matches_extraction_error():
+    """The pre-flight reason is the very message extraction would raise with."""
+    cfg = ContentCoreConfig(document_engine="docling")
+    with _docling_missing(), patch(
+        "content_core.content.identification.get_file_type",
+        new_callable=AsyncMock,
+        return_value="application/pdf",
+    ):
+        verdict = await check_file_support("/tmp/test.pdf", config=cfg)
+        with pytest.raises(ConfigurationError) as exc_info:
+            await extract_content(file_path="/tmp/test.pdf", config=cfg)
+    assert verdict.reason == str(exc_info.value)
+
+
+def test_configuration_error_is_exported_from_package():
+    import content_core
+
+    assert content_core.ConfigurationError is ConfigurationError
+    assert "ConfigurationError" in content_core.__all__
+
+
+# ---------------------------------------------------------------------------
+# 17. OpenDocument MIME types route to the office processor
+# ---------------------------------------------------------------------------
+ODF_MIMES = [
+    "application/vnd.oasis.opendocument.text",
+    "application/vnd.oasis.opendocument.spreadsheet",
+    "application/vnd.oasis.opendocument.presentation",
+]
+
+
+@pytest.mark.parametrize("engine", ["simple", "auto"])
+@pytest.mark.parametrize("mime", ODF_MIMES)
+def test_route_for_mime_odf_is_office(mime, engine):
+    assert _route_for_mime(mime, ContentCoreConfig(document_engine=engine)) == "office"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mime", ODF_MIMES)
+async def test_check_file_support_odf_supported(mime):
+    cfg = ContentCoreConfig(document_engine="simple")
+    with patch(
+        "content_core.content.identification.get_file_type",
+        new_callable=AsyncMock,
+        return_value=mime,
+    ):
+        result = await check_file_support("/tmp/test.odf", config=cfg)
+    assert result.supported is True
+    assert result.processor == "office"
+    assert result.identified_type == mime
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mime", ODF_MIMES)
+async def test_file_odf_calls_extract_office(mime):
+    expected = _make_output(identified_type=mime)
+    cfg = ContentCoreConfig(document_engine="simple")
+    with patch(
+        "content_core.content.identification.get_file_type",
+        new_callable=AsyncMock,
+        return_value=mime,
+    ), patch(
+        "content_core.extraction.extract_office",
+        new_callable=AsyncMock,
+        return_value=expected,
+    ) as mock:
+        result = await extract_content(file_path="/tmp/test.odf", config=cfg)
+        mock.assert_awaited_once_with("/tmp/test.odf", mime, cfg)
+        assert result is expected

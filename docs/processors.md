@@ -62,8 +62,8 @@ The `url_engine` setting controls which processor handles web URLs. When set to 
 - File: `crawl4ai.py`
 - Two modes: local browser automation or Docker API
 - **Local mode** (default): Requires `pip install content-core[crawl4ai]` and `python -m playwright install --with-deps`
-- **Docker mode**: Set `CRAWL4AI_API_URL` (e.g., `http://localhost:11235`) to use a remote Crawl4AI container — no local Playwright needed
-- No API keys needed; all processing happens locally or on your server
+- **Docker mode**: Set `CRAWL4AI_API_URL` (e.g., `http://localhost:11235`) to use a remote Crawl4AI container — no local Playwright needed. Crawl4AI >= 0.9.0 requires a bearer token for external connections: set `CRAWL4AI_API_TOKEN` (or `crawl4ai_api_token` in the config file) and it is sent as `Authorization: Bearer <token>`; leave it unset for older or unauthenticated instances
+- No third-party API keys needed; all processing happens locally or on your server
 - Handles JavaScript-heavy sites well
 
 ## Document Processors
@@ -132,10 +132,19 @@ The `document_engine` setting controls document processing. When set to `auto` (
 - Sends the image to the vision model via Esperanto's `create_image_message` and returns a markdown description
 - Without vision configured, image extraction is unsupported (the file is skipped/placeholdered)
 
+### OpenDocument (ODT/ODS/ODP)
+
+- File: `document/odf.py`
+- Uses odfpy for LibreOffice/OpenOffice formats
+- ODT: paragraphs, headings (by outline level), lists and tables as markdown
+- ODS: one markdown table per sheet, preceded by `# Sheet: <sheet name>` (as for XLSX)
+- ODP: one block per slide (`# Slide N` followed by its text frames, as for PPTX)
+
 ### Docling (Optional)
 
 - File: `document/docling.py`
-- Requires `pip install content-core[docling]`
+- Requires `pip install content-core[docling]`; selecting `document_engine="docling"` without it
+  raises `ConfigurationError` (use `auto` or `simple` to proceed without Docling)
 - Supports PDF, DOCX, PPTX, XLSX, Markdown, AsciiDoc, HTML, CSV, and images
 - Configurable output format: markdown (default), HTML, or JSON
 - Provides richer structural parsing than the simple engine
@@ -204,6 +213,7 @@ Located in `src/content_core/processors/media/`.
 - Detection methods:
   - Binary signature matching for PDF, images, audio, video, and archives
   - ZIP structure inspection for Office formats (DOCX, XLSX, PPTX) and EPUB
+  - OpenDocument (ODT, ODS, ODP) identified by the ZIP's `mimetype` member
   - Content analysis for text-based formats (HTML, XML, JSON, YAML, CSV, Markdown)
 - Reads only the first 512 bytes for binary signatures and 1024 bytes for text content analysis
 - Works regardless of file extension

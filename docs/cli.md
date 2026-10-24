@@ -154,7 +154,9 @@ content-core config delete llm_provider
 |-----|-------------|---------|
 | `audio_concurrency` | Parallel transcription limit (1-10) | `3` |
 | `audio_model` | Override STT model | — |
+| `audio_segment_minutes` | Audio segment length in minutes; `0` disables splitting | `10` |
 | `crawl4ai_api_url` | Crawl4AI Docker API URL (omit for local mode) | — |
+| `crawl4ai_api_token` | Bearer token for the Crawl4AI Docker API (required by Crawl4AI >= 0.9.0) | — |
 | `audio_provider` | Override STT provider | — |
 | `docling_formulas` | Enable formula extraction | `false` |
 | `docling_ocr` | Enable OCR for scanned PDFs | `true` |
@@ -202,6 +204,14 @@ content-core config set llm_model claude-sonnet-4-20250514
 content-core config set url_engine firecrawl
 ```
 
+`config set` rejects a value that the setting does not accept — `url_engine`
+takes `auto`, `simple`, `firecrawl`, `jina` or `crawl4ai`, and
+`document_engine` takes `auto`, `simple` or `docling` — and writes nothing to
+the file when it does.
+The same closed vocabulary is enforced on constructor arguments, `CCORE_*`
+environment variables and values edited into the TOML by hand: an unknown
+engine name fails immediately instead of surfacing as empty content.
+
 Or edit `~/.content-core/config.toml` directly:
 
 ```toml
@@ -222,7 +232,9 @@ export OPENAI_API_KEY=sk-...
 ### Engine flag
 
 The `--engine` flag is routed automatically based on input type:
-- **URLs** → overrides `url_engine` (options: `firecrawl`, `jina`, `crawl4ai`, `simple`)
-- **Files** → overrides `document_engine` (options: `docling`, `simple`)
+- **URLs** → overrides `url_engine` (options: `auto`, `firecrawl`, `jina`, `crawl4ai`, `simple`)
+- **Files** → overrides `document_engine` (options: `auto`, `docling`, `simple`). `--engine docling`
+  requires `pip install content-core[docling]`; without it the command fails instead of
+  falling back to the simple engine
 
 See [Usage documentation](usage.md) for all configuration options.

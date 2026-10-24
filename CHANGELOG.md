@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-10-03
+
+### Added
+- OpenDocument extraction for `.odt`, `.ods` and `.odp` through the office route, using `odfpy` (new core dependency). Text documents become markdown paragraphs, headings, lists and tables; spreadsheets become one markdown table per sheet; presentations become one block per slide. Detection reads the ZIP's `mimetype` member, so a wrong or missing extension still works (#43).
+- YouTube cookie and proxy support for the transcript path (#46). `youtube_cookies_file` (`CCORE_YOUTUBE_COOKIES_FILE`) loads a Netscape `cookies.txt` into the `youtube-transcript-api` session, unblocking IP-flagged networks; a missing or unreadable file raises `ConfigurationError`. `youtube_proxy` (`CCORE_YOUTUBE_PROXY`) routes both `youtube-transcript-api` and the `pytubefix` fallback through a proxy URL — use a residential proxy, as datacenter proxies are blocked. With neither set, behavior is unchanged. Cookie values are never logged.
+- `audio_segment_minutes` setting (`CCORE_AUDIO_SEGMENT_MINUTES`) controls the length of the segments long audio is split into before transcription. The default stays 10 minutes; `0` sends the file whole, for self-hosted STT endpoints without an upload size limit (#94).
+
+### Changed
+- **URL extraction failures now raise instead of returning empty output** (#60). `content=""` now only means the source was genuinely empty. A named `url_engine` that fails raises `NetworkError` (connection/timeout/DNS), `NotFoundError` (HTTP 404/410 from the page, `simple` engine), `ExternalServiceError` (engine API or HTTP errors) or `ConfigurationError` (`crawl4ai` not installed). `auto` still falls through firecrawl → jina → crawl4ai → simple and raises the last error only when every engine failed. A malformed URL raises `InvalidInputError`. The `simple` engine no longer returns `"Failed to extract content: ..."` or `"No content found"` as page content. Remote-file downloads raise the same typed errors, and a download that cannot be saved locally raises `FileOperationError`.
+- File extraction failures raise typed errors (#60): corrupted PDF, EPUB or unreadable text files raise `FileOperationError` (chained to the original cause) instead of bare `Exception`/`RuntimeError`; a missing file still raises `FileNotFoundError`. ffmpeg/ffprobe failures in audio and video processing raise `FileOperationError`: video extraction no longer returns empty content when ffprobe or ffmpeg fails. Speech-to-text provider failures (after retries) raise `ExternalServiceError`, and an STT model that cannot be created raises `ConfigurationError`.
+- Retry classification now treats `ConfigurationError`, `UnsupportedTypeException`, `InvalidInputError` and `FileOperationError` as permanent and `NetworkError` as transient (#60).
+- YouTube extraction raises instead of returning empty content when no transcript can be fetched (#60): `NoTranscriptFound` when neither youtube-transcript-api nor pytubefix finds a transcript, `ExternalServiceError` (chained to the provider error) when YouTube blocks or fails the request on both paths, e.g. `IpBlocked`, and `InvalidInputError` for a YouTube URL without a video ID. Provider errors from `get_best_transcript` and `extract_transcript_pytubefix` now propagate after retries instead of being swallowed (`extract_transcript_pytubefix` still returns `(None, None)` for a video without captions); a failure of the first path still falls back to the second.
+- An explicit `audio_provider`/`audio_model` that cannot be created now raises `ConfigurationError` instead of silently transcribing with the default STT model, per "Explicit choice is a requirement" (#99).
+- youtube-transcript-api failures are retried by type: blocked requests (`RequestBlocked`/`IpBlocked`) are retried, so a rotating proxy can get a new IP; other transcript errors that name a state of the video (unavailable, transcripts disabled, age-restricted...) are not (#99).
+
+### Fixed
+- `youtube_proxy` now also applies to the YouTube video title lookup, which previously used only env-var proxies (#99).
+- `requests`, imported directly for the YouTube cookie session, is declared as a dependency instead of arriving transitively (#99).
+- A failed Crawl4AI crawl (navigation timeout, blocked page) now raises `ExternalServiceError` instead of failing with a pydantic `ValidationError` on `content=None`, and `auto` falls through to the next engine. Applies to both the local browser and the Docker API mode (#101).
+
+### Security
+- Raised minimum versions to releases without known vulnerabilities: `aiohttp>=3.14.3`, `pillow>=12.3.0`, `click>=8.3.3`, `pydantic-settings>=2.14.2`, and in the extras `docling>=2.94.0`, `crawl4ai>=0.9.0` and `langchain-core>=1.3.3`. Upgrading content-core upgrades these packages in an existing environment. The development lock was refreshed; it now also exercises `fastmcp` 4 and `mcp` 2, which fresh installs already resolve to (#102).
+
+## [2.1.0] - 2026-09-06
+
+### Added
+- Local HTML file ingestion through the simple engine, including `.html`/`.htm` routing, HTML-to-Markdown conversion, document titles, minimal HTML documents, BOMs and legacy character encodings (#59, #66).
+- Public exception exports from `content_core`: `ContentCoreError`, `UnsupportedTypeException`, `InvalidInputError`, `ConfigurationError`, `NotFoundError`, `NoTranscriptFound`, `NetworkError`, `ExternalServiceError` and `FileOperationError` (#50, #52). Typed failures can be caught through the public API. Some existing failures still escape as untyped exceptions until #60; exporting the taxonomy does not complete that migration.
+
+### Changed
+- PyPI publication starts when a GitHub Release is published, including publishing a draft. Creating or pushing a tag alone no longer publishes. The packaging gate verifies that the release tag matches the package version (#93).
+- Library imports no longer configure process-wide Loguru handlers. Content Core logging is disabled by default for library consumers; use `logger.enable("content_core")` with the host application's handlers, or `content_core.configure_logging()` from an application entry point. CLI and MCP entry points configure their own stderr logging and honor debug settings (#47).
+- Published wheel and sdist now come directly from the artifacts validated by the publishing workflow's packaging job, rather than being rebuilt in the upload job (#57).
+
+### Removed
+- Unused `asciidoc` dependency (#58).
+- Unused internal `Processor` Protocol; processor contracts remain documented in `ARCHITECTURE.md` (#53).
+- Unused internal exception classes `DatabaseOperationError`, `AuthenticationError` and `RateLimitError` (#52). None had a raise site; direct imports from `content_core.common.exceptions` must be updated. The replacement taxonomy is public, but provider error wrapping is still incomplete pending #60.
+
+### Fixed
+- Explicit `document_engine="docling"` now raises `ConfigurationError` when the optional engine is unavailable, instead of silently using the simple engine. The error names `pip install "content-core[docling]"` and the `CCORE_DOCUMENT_ENGINE=simple` alternative. `auto` still permits fallback, and `check_file_support` returns an unsupported verdict with the reason (#50).
+- Invalid engine names are rejected at configuration entry points, including constructor arguments, environment variables, TOML files and `content-core config set`. Misspelled boolean values are also rejected before writing; CLI/MCP validate engine names for the input type (#51).
+- MCP `serverInfo.version` reports the installed Content Core version instead of FastMCP's version (#56).
+
+### Documentation
+- Documented Firecrawl-compatible backends through `FIRECRAWL_API_URL` (#86).
+
+## [2.0.7] - 2026-09-02
+
+### Added
+- `crawl4ai_api_token` setting (env var `CRAWL4AI_API_TOKEN`, mirroring `CRAWL4AI_API_URL`) for the Crawl4AI Docker API (#80)
+
+### Fixed
+- Video extraction wrote its intermediate `<name>_audio.mp3` next to the user's source video and deleted it afterwards (#74), silently destroying a pre-existing file of that name, failing on read-only source directories, and colliding across concurrent extractions. The intermediate now lives in a temporary directory, mirroring audio transcription
+- Crawl4AI Docker mode was rejected by any Crawl4AI >= 0.9.0 instance (#80): the client posted to `/crawl` with no `Authorization` header, and recent versions require a bearer token for external connections by default. The token is now sent as `Authorization: Bearer <token>` when configured; unset keeps the previous unauthenticated behavior
+
 ## [2.0.6] - 2026-07-30
 
 ### Fixed

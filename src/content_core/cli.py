@@ -1,6 +1,7 @@
 """Content Core CLI — extract and summarize content."""
 import asyncio
 import sys
+from typing import get_args
 
 import click
 
@@ -15,10 +16,16 @@ def _get_version():
 @click.group()
 @click.version_option(package_name="content-core")
 @click.option("--debug", is_flag=True, help="Enable debug logging")
-def cli(debug):
+@click.pass_context
+def cli(ctx, debug):
     """Content Core — Extract and summarize content from any source."""
-    if debug:
-        configure_logging(debug=True)
+    # The CLI is an application, so it may configure logging. The library keeps
+    # itself disabled by default; this re-enables it for CLI runs.
+    configure_logging(debug=debug)
+    # Stashed so subcommands that hand off to another entrypoint (`mcp`) can
+    # forward the flag instead of letting it be reconfigured away.
+    ctx.ensure_object(dict)
+    ctx.obj["debug"] = debug
 
 
 @cli.command()
@@ -87,11 +94,12 @@ def summarize(content, context):
 
 
 @cli.command()
-def mcp():
+@click.pass_context
+def mcp(ctx):
     """Start the MCP server."""
     from content_core.mcp.server import main
 
-    main()
+    main(debug=ctx.obj.get("debug", False))
 
 
 @cli.group()
@@ -101,7 +109,9 @@ def config():
     \b
     Available keys:
       audio_concurrency    Parallel transcription limit (1-10, default: 3)
+      audio_segment_minutes  Audio segment length in minutes, 0 disables splitting (default: 10)
       crawl4ai_api_url     Crawl4AI Docker API URL (default: none, uses local mode)
+      crawl4ai_api_token   Bearer token for the Crawl4AI Docker API (required by Crawl4AI >= 0.9.0)
       audio_model          Override STT model
       audio_provider       Override STT provider
       docling_output_format  Docling output format (default: markdown)
@@ -124,6 +134,17 @@ def config():
     pass
 
 
+_SECRET_KEY_MARKERS = ("token", "key", "secret", "password")
+
+
+def _display_value(key: str, value):
+    """Mask credential-like config values so they never land on stdout."""
+    lowered = key.lower()
+    if isinstance(value, str) and value and any(m in lowered for m in _SECRET_KEY_MARKERS):
+        return "****" + value[-4:] if len(value) > 8 else "****"
+    return value
+
+
 @config.command("list")
 def config_list_cmd():
     """List all config values from the config file."""
@@ -136,7 +157,7 @@ def config_list_cmd():
         click.echo("Run 'content-core config --help' to see available keys.")
         return
     for key, value in sorted(data.items()):
-        click.echo(f"{key} = {value}")
+        click.echo(f"{key} = {_display_value(key, value)}")
 
 
 @config.command("set")
@@ -156,7 +177,7 @@ def config_set_cmd(key, value):
 
     try:
         config_set(key, value)
-        click.echo(f"{key} = {value}")
+        click.echo(f"{key} = {_display_value(key, value)}")
     except ValueError as e:
         click.echo(f"Error: {e}", err=True)
         sys.exit(1)
@@ -204,10 +225,11 @@ def _build_config(inp, engine, formulas=False, pictures=False, no_ocr=False):
     if not engine and not docling_overrides:
         return None
 
+    from content_core.common.types import DocumentEngine, UrlEngine
     from content_core.config import ContentCoreConfig
 
-    VALID_URL_ENGINES = {"auto", "simple", "firecrawl", "jina", "crawl4ai"}
-    VALID_DOC_ENGINES = {"auto", "simple", "docling"}
+    VALID_URL_ENGINES = set(get_args(UrlEngine))
+    VALID_DOC_ENGINES = set(get_args(DocumentEngine))
 
     kwargs = {**docling_overrides}
     if engine:
