@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- DOCX extraction keeps tables, as markdown tables in their place in the document, and the text of hyperlinks, written as `[text](url)`. Tables were left out entirely, and a linked phrase disappeared from its paragraph.
+- PPTX extraction keeps the text of grouped shapes, nested groups included, and of slide tables, written as markdown tables. Only shapes with text of their own were read, so both were lost.
+
+## [2.3.0] - 2026-11-07
+
+### Added
+- Docling image descriptions can use any OpenAI-compatible chat completions endpoint (vLLM, Ollama, LM Studio, MLX servers...) instead of Docling's small inline model (#111, building on #104 by PhantombrainM). Set `docling_vision_url` (`CCORE_DOCLING_VISION_URL`), with optional `docling_vision_model`, `docling_vision_api_key`, `docling_vision_prompt`, `docling_vision_max_tokens` (default 400), `docling_vision_timeout` (default 20s) and `docling_vision_token_param` (`max_completion_tokens` or `max_tokens`). Applies only when `docling_vision` is on; without the URL, behavior is unchanged and nothing leaves the machine. Chart data extraction still uses Docling's own model. All settings work from the constructor, env vars and `content-core config set`.
+
+## [2.2.1] - 2026-11-03
+
+### Security
+- URL fetches made directly by content-core (the `simple` engine, the MIME-type probe, remote file downloads and Reddit posts) refuse link-local and cloud-metadata addresses, including on every redirect hop and for hostnames that resolve to them. Private and loopback addresses are still allowed. A refused URL raises `InvalidInputError` (`BlockedAddressError`).
+
 ## [2.2.0] - 2026-10-03
 
 ### Added
